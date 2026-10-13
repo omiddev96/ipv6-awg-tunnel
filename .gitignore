@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.key
+*.conf
+*.db
+*.log
+*.peer.json
+state.json
+backups/
+.env*
+test-v6*.txt
+payload*.json
