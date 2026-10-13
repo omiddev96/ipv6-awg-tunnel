@@ -19,10 +19,10 @@ On both servers, download/review this repository, then run:
 sudo bash install.sh wizard
 ```
 
-Start the **exit** wizard first. It displays a **public JSON profile**. Paste
-that profile into the **Iran** wizard, then copy the Iran wizard's updated
-public profile back to the exit wizard. Finish pasted JSON with one blank line.
-No private key or server password is exchanged.
+Start the **exit** wizard first. It displays one **public pairing code**
+beginning with `AWG1-`. Copy that ONE LINE into the **Iran** wizard, then copy
+the Iran wizard's return code back into the exit wizard. Press Enter after each
+code. No multi-line JSON editing, private key, or server password is needed.
 
 After both peers are configured, the wizard tests the tunnel and offers optional
 3x-ui integration on the Iran side. Existing installations can resume; they are
@@ -326,6 +326,26 @@ sudo journalctl -u awg-quick@awg-v6 -n 80 --no-pager
 sudo systemctl restart awg-quick@awg-v6
 ```
 
+### Recover an earlier failed setup (including off-subnet IPv6 gateways)
+
+Update your downloaded repository, install the updated manager in place, and
+repair the managed service **without regenerating keys**:
+
+```bash
+cd ipv6-awg-tunnel
+git pull --ff-only
+sudo install -m 755 tunnel.py /opt/ipv6-awg-tunnel/tunnel.py
+sudo ipv6-awg-tunnel repair
+sudo ipv6-awg-tunnel test
+```
+
+Run those commands on each server. The repair command preserves public/private
+keys, ports, peer identity, and inner networks. It recalculates the managed
+endpoint host route and retains the default route's `onlink` property when the
+provider uses an off-subnet gateway. It does not overwrite an unowned host route.
+The updated wizard also offers automatic recovery when resuming an inactive
+managed service.
+
 Restarting the tunnel temporarily interrupts routed VPN traffic. Management
 traffic keeps the physical main route. No global default route is replaced.
 
@@ -448,6 +468,13 @@ service restart, fail-closed behavior, and 3x-ui integration were live-tested
 on Ubuntu 24.04. The generalized installer itself needs a clean-server trial
 before broad production rollout. CI performs static/unit tests, not root-level
 network integration tests.
+
+An additional live two-VPS Ubuntu 24.04 test found and fixed a provider-specific
+off-subnet IPv6 gateway issue: `ip route get` omitted `onlink` even though the
+default route required it. The manager now checks both. Repair/start, marked
+dual-stack Internet egress, UDP DNS, full-size packets, and fail-closed/restart
+behavior are covered by the repeatable test procedure above. No live addresses
+or private data from that deployment are included here.
 
 ## Upstream references
 

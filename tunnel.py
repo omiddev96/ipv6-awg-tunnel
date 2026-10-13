@@ -44,8 +44,11 @@ def run(*args, check=True, capture=True, input=None):
                        capture_output=capture)
     if check and p.returncode:
         # Do not echo subprocess arguments: some commands handle private keys.
-        raise Error("A system command failed (exit %d). Check service/package logs."
-                    % p.returncode)
+        detail = ""
+        if capture and str(args[0]) in ("ip", "sysctl"):
+            detail = " " + (p.stderr or "").strip()[-400:]
+        raise Error("A system command failed (exit %d).%s Check service/package logs."
+                    % (p.returncode, detail))
     return p
 
 
@@ -128,7 +131,7 @@ def parameters():
 
 def validate_parameters(p):
     names = {"Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"}
-    if set(p) != names or any(type(v) is not int for v in p.values()):
+    if not isinstance(p, dict) or set(p) != names or any(type(v) is not int for v in p.values()):
         raise Error("Unexpected obfuscation parameters.")
     if not 1 <= p["Jc"] <= 128 or not 0 <= p["Jmin"] < p["Jmax"] <= 1280:
         raise Error("Invalid junk packet parameters.")
@@ -151,6 +154,8 @@ def profile(s):
 
 def read_peer(path, s):
     p = json.loads(Path(path).read_text())
+    if not isinstance(p, dict):
+        raise Error("The public peer profile must be a JSON object.")
     expected = "exit" if s["role"] == "iran" else "iran"
     if p.get("format") != 1 or p.get("role") != expected:
         raise Error("The peer profile must describe the opposite role.")
@@ -164,6 +169,26 @@ def read_peer(path, s):
         raise Error("Both servers must use the same inner networks.")
     validate_parameters(p["parameters"])
     return p
+
+
+def pairing_code(s):
+    """Single-line PUBLIC profile, not a secret or an authentication token."""
+    data = json.dumps(profile(s), separators=(",", ":")).encode()
+    return "AWG1-" + base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def decode_pairing_code(text):
+    if not text.startswith("AWG1-") or len(text) > 8192:
+        raise Error("Expected the other server's AWG1- public pairing code.")
+    body = text[5:]
+    try:
+        data = json.loads(base64.b64decode(body + "=" * (-len(body) % 4),
+                                           altchars=b"-_", validate=True))
+        if not isinstance(data, dict):
+            raise Error("The public pairing code must contain a profile object.")
+        return data
+    except (ValueError, TypeError):
+        raise Error("Invalid public pairing code.")
 
 
 def assigned(value):
@@ -328,8 +353,10 @@ def init(args):
         s = load()
     if args.export:
         write_private(args.export, json.dumps(profile(s), indent=2) + "\n")
-    print("Initialized " + args.role + ". Public peer profile (no private key):")
-    print(json.dumps(profile(s), indent=2))
+    print("Initialized " + args.role + ".")
+    if not getattr(args, "quiet", False):
+        print("Public peer profile (no private key):")
+        print(json.dumps(profile(s), indent=2))
     print("Open this UDP port in provider firewalls; keep management access unchanged.")
 
 
@@ -343,7 +370,42 @@ def route_spec(s):
     if data.get("gateway"):
         cmd += ["via", data["gateway"]]
     cmd += ["dev", s["nic"], "src", s["local_ipv6"]]
+    # `route get` may omit onlink even when a VPS default gateway needs it.
+    onlink = "onlink" in data.get("flags", [])
+    if data.get("gateway") and not onlink:
+        defaults = json.loads(run("ip", "-j", "-6", "route", "show", "default").stdout)
+        onlink = any(
+            r.get("gateway") == data["gateway"] and r.get("dev") == s["nic"]
+            and "onlink" in r.get("flags", []) for r in defaults)
+    if onlink:
+        cmd += ["onlink"]
     return cmd
+
+
+def repair(args):
+    """Rebuild an owned endpoint route without changing keys or peer identity."""
+    root()
+    s = load()
+    if not s.get("peer") or s.get("uninstalled"):
+        raise Error("Repair requires an existing, configured peer.")
+    print("Repairing the managed service; routed VPN traffic is briefly interrupted.")
+    run("systemctl", "stop", service(s), check=False)
+    policy(argparse.Namespace(action="down"))
+    policy(argparse.Namespace(action="finish"))
+    s = load()
+    existing = run("ip", "-6", "route", "show", "exact", s["peer"]["ipv6"] + "/128").stdout.strip()
+    if existing:
+        raise Error("An unowned endpoint route remains. Review it manually; it was not overwritten.")
+    s["host_route"] = route_spec(s)
+    save(s)
+    write_private(config_path(s), render(s, (STATE_DIR / "private.key").read_text().strip()))
+    try:
+        run("systemctl", "restart", service(s))
+    except Error:
+        policy(argparse.Namespace(action="down"))
+        policy(argparse.Namespace(action="finish"))
+        raise
+    print("Managed service repaired. Existing keys, ports and peer identity preserved.")
 
 
 def peer(args):
@@ -762,22 +824,19 @@ def wizard(args):
             role=role, local_ipv6=address, port=int(port_text) if port_text else None,
             interface="awg-v6", mtu=int(mtu) if mtu else 1420, table=51871,
             priority=11071, ipv4_network="10.77.77.0/30", ipv6_network="fd77:77:77::/64",
-            peer_file=None, export=None)
+            peer_file=None, export=None, quiet=True)
         init(options)
         s = load()
     if not s.get("peer"):
         if s["role"] == "exit":
-            print("COPY THIS PUBLIC PROFILE to the Iran server wizard:")
-            print(json.dumps(profile(s), indent=2))
-        print("Paste the OTHER server's public JSON profile; finish with a blank line.")
-        print("Start on exit, paste exit profile into Iran, then paste Iran's updated profile here.")
-        lines = []
-        while True:
-            line = input()
-            if not line.strip():
-                break
-            lines.append(line)
-        data = json.loads("\n".join(lines))
+            print("STEP 1: On the IRAN server run this wizard and choose 'iran'.")
+            print("STEP 2: Copy this SINGLE-LINE PUBLIC pairing code into the Iran wizard:")
+            print(pairing_code(s))
+            print("STEP 3: The Iran wizard displays a return code. Paste it below.")
+        else:
+            print("On the EXIT server run this wizard first and choose 'exit'.")
+        code = input("Paste the OTHER server's AWG1- public pairing code, then press Enter: ").strip()
+        data = decode_pairing_code(code)
         # Validate before installing or opening a peer.
         peer_path = STATE_DIR / "wizard.peer.json"
         write_private(peer_path, json.dumps(data))
@@ -787,8 +846,10 @@ def wizard(args):
             peer_path.unlink(missing_ok=True)
         s = load()
         if s["role"] == "iran":
-            print("COPY THIS UPDATED PUBLIC PROFILE back to the exit server wizard:")
-            print(json.dumps(profile(s), indent=2))
+            print("Copy this SINGLE-LINE return code into the EXIT server wizard:")
+            print(pairing_code(s))
+    elif run("systemctl", "is-active", "--quiet", service(s), check=False).returncode:
+        repair(argparse.Namespace())
     input("Finish peer configuration on the other server, then press Enter to test: ")
     test(argparse.Namespace())
     if s["role"] == "iran" and not s.get("panel"):
@@ -863,7 +924,8 @@ def parser():
     a.add_argument("--output")
     a.set_defaults(func=export)
     sub.add_parser("wizard", help="Interactive English setup with public profile exchange").set_defaults(func=wizard)
-    for name, fn in (("status", status), ("test", test), ("rollback-panel", rollback_panel)):
+    for name, fn in (("status", status), ("test", test), ("rollback-panel", rollback_panel),
+                     ("repair", repair)):
         sub.add_parser(name).set_defaults(func=fn)
     a = sub.add_parser("panel", help="Route selected 3x-ui inbounds through the tunnel")
     a.add_argument("--yes", action="store_true")

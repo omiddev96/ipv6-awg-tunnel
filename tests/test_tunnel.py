@@ -117,6 +117,34 @@ class Validation(unittest.TestCase):
 
 
 class Configuration(unittest.TestCase):
+    def test_off_link_gateway_flag_from_default_route(self):
+        selected = [{"gateway": "2606:4700::beef", "dev": "eth0", "flags": []}]
+        defaults = [{"dst": "default", "gateway": "2606:4700::beef",
+                     "dev": "eth0", "flags": ["onlink"]}]
+        with patch.object(t, "run", side_effect=[
+                result(json.dumps(selected)), result(json.dumps(defaults))]):
+            cmd = t.route_spec(state())
+        self.assertIn("onlink", cmd)
+        self.assertEqual(cmd[:4], ["ip", "-6", "route", "add"])
+
+    def test_normal_gateway_does_not_add_onlink(self):
+        selected = [{"gateway": "fe80::1", "dev": "eth0", "flags": []}]
+        with patch.object(t, "run", side_effect=[
+                result(json.dumps(selected)), result("[]")]):
+            self.assertNotIn("onlink", t.route_spec(state()))
+
+    def test_onlink_from_route_get(self):
+        selected = [{"gateway": "fe80::1", "dev": "eth0", "flags": ["onlink"]}]
+        with patch.object(t, "run", return_value=result(json.dumps(selected))) as cmd:
+            self.assertIn("onlink", t.route_spec(state()))
+            self.assertEqual(cmd.call_count, 1)
+
+    def test_wrong_physical_interface_refused(self):
+        selected = [{"gateway": "fe80::1", "dev": "some-other-tunnel"}]
+        with patch.object(t, "run", return_value=result(json.dumps(selected))):
+            with self.assertRaises(t.Error):
+                t.route_spec(state())
+
     def test_config_no_default_route_replacement(self):
         text = t.render(state(), "TEST_ONLY_NOT_A_REAL_PRIVATE_KEY")
         self.assertIn("Table = off", text)
@@ -275,7 +303,7 @@ class PanelTemplate(unittest.TestCase):
 class CLI(unittest.TestCase):
     def test_expected_subcommands(self):
         p = t.parser()
-        for cmd in ("test", "status", "rollback-panel", "wizard"):
+        for cmd in ("test", "status", "rollback-panel", "wizard", "repair"):
             self.assertEqual(p.parse_args([cmd]).command, cmd)
         self.assertEqual(p.parse_args(["peer", "--file", "p.json"]).file, "p.json")
 
@@ -305,6 +333,43 @@ class CLI(unittest.TestCase):
             file.exists.return_value = False
             with self.assertRaises(t.Error):
                 t.wizard(types.SimpleNamespace())
+
+    def test_pairing_code_round_trip_is_public_only(self):
+        s = state("exit")
+        s["private_key"] = "SHOULD_NOT_APPEAR"
+        code = t.pairing_code(s)
+        self.assertTrue(code.startswith("AWG1-"))
+        decoded = t.decode_pairing_code(code)
+        self.assertEqual(decoded, t.profile(s))
+        self.assertNotIn("SHOULD_NOT_APPEAR", json.dumps(decoded))
+
+    def test_bad_pairing_code(self):
+        for code in ("", "AWG1-not!base64", "other-value", "AWG1-" + "x" * 8192):
+            with self.subTest(code=code[:20]), self.assertRaises(t.Error):
+                t.decode_pairing_code(code)
+
+    def test_pairing_code_rejects_non_object_json(self):
+        encoded = base64.urlsafe_b64encode(b"[]").decode().rstrip("=")
+        with self.assertRaises(t.Error):
+            t.decode_pairing_code("AWG1-" + encoded)
+
+    def test_non_object_parameters(self):
+        for value in (None, [], "bad"):
+            with self.assertRaises(t.Error):
+                t.validate_parameters(value)
+
+    def test_wizard_resumes_failed_service_without_rekey(self):
+        s = state("exit")
+        with patch.object(t, "root"), patch.object(t, "STATE_FILE") as f, \
+                patch.object(t, "load", return_value=s), \
+                patch.object(t, "run", return_value=result(code=1)), \
+                patch.object(t, "repair") as repair, patch.object(t, "init") as init, \
+                patch.object(t, "test") as test, patch("builtins.input", return_value=""):
+            f.exists.return_value = True
+            t.wizard(types.SimpleNamespace())
+        repair.assert_called_once()
+        init.assert_not_called()
+        test.assert_called_once()
 
 
 if __name__ == "__main__":
